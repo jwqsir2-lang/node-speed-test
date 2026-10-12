@@ -73,9 +73,13 @@ class App:
         # ---- 操作区 ----
         act = ttk.Frame(top)
         act.pack(side="top", fill="x", padx=6, pady=2)
-        self.btn_start = ttk.Button(act, text="开始测速", command=self.start_test)
+        self.btn_start = ttk.Button(act, text="开始测速(延时+下载)", command=self.start_test)
         self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(act, text="停止测速", command=self.stop_test, state="disabled")
+        self.btn_lat = ttk.Button(act, text="只测延时", command=self.start_latency)
+        self.btn_lat.pack(side="left", padx=(4, 0))
+        self.btn_dl = ttk.Button(act, text="只测下载", command=self.start_download)
+        self.btn_dl.pack(side="left", padx=(4, 0))
+        self.btn_stop = ttk.Button(act, text="停止", command=self.stop_test, state="disabled")
         self.btn_stop.pack(side="left", padx=(4, 0))
         self.btn_clear = ttk.Button(act, text="清空结果", command=self.clear_results)
         self.btn_clear.pack(side="left", padx=(4, 0))
@@ -112,7 +116,20 @@ class App:
         self.menu.add_command(label="复制选中行(JSON)", command=self.copy_rows_json)
         self.menu.add_separator()
         self.menu.add_command(label="查看节点详情", command=self.show_detail)
+        self.menu.add_separator()
+        self.menu.add_command(label="删除选中节点", command=self.delete_selected)
+        self.menu.add_command(label="只测选中节点(延时+下载)", command=self.test_selected)
+        self.menu.add_command(label="只测选中节点(延时)", command=self.lat_selected)
         self.tree.bind("<Button-3>", self.popup_menu)
+
+        # ---- 活动日志 ----
+        logf = ttk.LabelFrame(self.root, text="活动日志")
+        logf.pack(side="top", fill="x", padx=6, pady=(2, 4))
+        self.log = tk.Text(logf, height=5, state="disabled", wrap="word")
+        self.log.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
+        lsb = ttk.Scrollbar(logf, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=lsb.set)
+        lsb.pack(side="right", fill="y", pady=4)
 
         # ---- 导出区 ----
         bot = ttk.Frame(self.root)
@@ -326,26 +343,80 @@ class App:
         self._import(txt, "剪贴板")
 
     # ---------------- 测速 ----------------
+    def _snapshot_params(self):
+        return {"concurrency": self.conc_var.get(),
+                "timeout_lat": self.latto_var.get(),
+                "timeout_dl": self.dlto_var.get(),
+                "dl_bytes": self.dlkb_var.get() * 1000}
+
+    def _start_buttons(self):
+        for b in (self.btn_start, self.btn_lat, self.btn_dl):
+            b.config(state="disabled")
+        self.btn_stop.config(state="normal")
+
+    def _end_buttons(self):
+        for b in (self.btn_start, self.btn_lat, self.btn_dl):
+            b.config(state="normal")
+        self.btn_stop.config(state="disabled")
+
     def start_test(self):
+        """延时+下载 两阶段。"""
+        self._run_phases(["latency", "download"])
+
+    def start_latency(self):
+        """只测延时。已有下载结果会保留。"""
+        self._run_phases(["latency"])
+
+    def start_download(self):
+        """只测下载。沿用已有延时结果（没有则把全部节点当存活）。"""
+        self._run_phases(["download"])
+
+    def test_selected(self):
+        sel = self._selected_nodes()
+        if not sel:
+            messagebox.showwarning("未选中节点", "请先在列表里选中节点。")
+            return
+        self._run_phases(["latency", "download"], only=sel)
+
+    def lat_selected(self):
+        sel = self._selected_nodes()
+        if not sel:
+            messagebox.showwarning("未选中节点", "请先在列表里选中节点。")
+            return
+        self._run_phases(["latency"], only=sel)
+
+    def _run_phases(self, phases, only=None):
+        """统一入口。phases 为 ['latency'] / ['download'] / 两者。"""
         if not self.nodes:
             messagebox.showwarning("没有节点", "请先导入节点。")
             return
         if self.running:
             return
+        nodes = only if only else self.nodes
+        if not nodes:
+            return
         self.running = True
-        self.results = {}
-        # 主线程里把参数快照下来，工作线程不准碰 Tkinter 变量
-        self._params = {"concurrency": self.conc_var.get(),
-                        "timeout_lat": self.latto_var.get(),
-                        "timeout_dl": self.dlto_var.get(),
-                        "dl_bytes": self.dlkb_var.get() * 1000}
-        self.btn_start.config(state="disabled")
-        self.btn_stop.config(state="normal")
-        self.prog["maximum"] = len(self.nodes)
+        self._params = self._snapshot_params()
+        # 清旧结果：全量测才清，单测只覆盖被测节点
+        if not only:
+            if "latency" in phases:
+                # 全量延时：重置全部结果
+                self.results = {}
+            else:
+                # 只测下载：保留延时结果，只清下载相关
+                for r in self.results.values():
+                    r["dl_mbps"] = None
+                    r["err"] = None
+        self._start_buttons()
+        self.prog["maximum"] = len(nodes)
         self.prog["value"] = 0
         self.refresh_table()
-        self._set_status("正在启动测速内核…")
-        threading.Thread(target=self._worker, daemon=True).start()
+        what = "+".join(p for p in phases)
+        whom = f"{len(nodes)} 个选中节点" if only else f"{len(nodes)} 个节点"
+        self._set_status(f"正在启动测速内核…")
+        self.log_msg(f"开始测试（{what}）：{whom}")
+        threading.Thread(target=self._worker, args=(phases, nodes, only is not None),
+                         daemon=True).start()
 
     def _set_status(self, text):
         """工作线程通过这个改状态栏（转发到主线程）。"""
@@ -354,33 +425,72 @@ class App:
         except RuntimeError:
             pass  # 窗口已关
 
+    def log_msg(self, text):
+        """活动日志（主线程安全）。"""
+        t = time.strftime("%H:%M:%S")
+        self.log.config(state="normal")
+        self.log.insert("end", f"[{t}] {text}\n")
+        self.log.see("end")
+        self.log.config(state="disabled")
+
     def stop_test(self):
         if self.tester:
             self.tester.stop()
             self._set_status("已请求停止…")
+            self.log_msg("用户请求停止…")
         self.btn_stop.config(state="disabled")
 
-    def _worker(self):
-        """工作线程：启 mihomo -> 并发测速 -> 回收。"""
+    def _worker(self, phases, nodes, is_subset):
+        """工作线程：启 mihomo -> 按阶段测 -> 回收。"""
         try:
             p = self._params
             self.tester = SpeedTester(concurrency=p["concurrency"],
                                      timeout_lat=p["timeout_lat"],
                                      timeout_dl=p["timeout_dl"],
                                      dl_bytes=p["dl_bytes"])
-            self.tester.start(self.nodes)
-            self._set_status("测速中…")
-            self.tester.run(self.nodes, on_result=self._on_result)
-            self._set_status(f"完成：{len(self.results)}/{len(self.nodes)} 已测")
+            self.tester.start(nodes)
+            done = 0
+            total = len(nodes)
+
+            def on_result(r):
+                nonlocal done
+                done += 1
+                self._on_result(r)
+                nm = r.get("name", "?")[:24]
+                lat = r.get("latency")
+                dl = r.get("dl_mbps")
+                if "download" in phases and dl is not None:
+                    self.log_msg(f"{nm}: 延时 {lat}ms, 下载 {dl} MB/s")
+                elif lat is not None:
+                    self.log_msg(f"{nm}: 延时 {lat}ms")
+                elif r.get("err"):
+                    self.log_msg(f"{nm}: 不通 ({r['err']})")
+
+            if "latency" in phases:
+                self._set_status(f"延时测试中… {done}/{total}")
+                self.tester.run_latency(nodes, on_result=on_result)
+                if self.tester and self.tester._stop.is_set():
+                    self.log_msg("延时测试被停止")
+            if "download" in phases and not (self.tester and self.tester._stop.is_set()):
+                dl_nodes = nodes
+                if "latency" in phases:
+                    # 两阶段：只测存活的
+                    dl_nodes = [n for n in nodes if self.results.get(n["name"], {}).get("alive")]
+                self._set_status(f"下载测试中…")
+                self.log_msg(f"下载测试：{len(dl_nodes)} 个存活节点")
+                self.tester.run_download(dl_nodes, on_result=on_result, results=list(self.results.values()))
+            n_done = len([r for r in self.results.values() if r.get("latency") is not None or r.get("err")])
+            self._set_status(f"完成：{n_done}/{total} 已测")
+            self.log_msg(f"测试完成")
         except Exception as e:
             self._set_status(f"出错: {type(e).__name__} {str(e)[:60]}")
+            self.log_msg(f"出错: {type(e).__name__} {str(e)[:80]}")
         finally:
             if self.tester:
                 self.tester.stop()
                 self.tester = None
             self.running = False
-            self.root.after(0, lambda: self.btn_start.config(state="normal"))
-            self.root.after(0, lambda: self.btn_stop.config(state="disabled"))
+            self.root.after(0, self._end_buttons)
 
     def _on_result(self, r):
         self.results[r["name"]] = r
@@ -452,6 +562,44 @@ class App:
         self.tree.tag_configure("bad", foreground="#b3261e")
         self.prog["value"] = len(self.results)
         self.prog["maximum"] = max(len(self.nodes), 1)
+
+    def _selected_nodes(self):
+        sel = self.tree.selection()
+        out = []
+        for iid in sel:
+            try:
+                i = int(iid)
+            except ValueError:
+                continue
+            if 0 <= i < len(self.nodes):
+                out.append(self.nodes[i])
+        return out
+
+    def delete_selected(self):
+        """删除选中的节点（从 self.nodes 和 self.results 里同时移除）。"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("未选中节点", "请先在列表里选中要删除的节点。")
+            return
+        idxs = []
+        for iid in sel:
+            try:
+                i = int(iid)
+            except ValueError:
+                continue
+            idxs.append(i)
+        if not idxs:
+            return
+        if not messagebox.askyesno("删除节点", f"确定删除选中的 {len(idxs)} 个节点吗？"):
+            return
+        names = {self.nodes[i]["name"] for i in idxs if 0 <= i < len(self.nodes)}
+        self.nodes = [n for n in self.nodes if n["name"] not in names]
+        for nm in names:
+            self.results.pop(nm, None)
+        self.log_msg(f"删除 {len(names)} 个节点，剩余 {len(self.nodes)} 个")
+        self.refresh_table()
+        self.status.config(text=f"剩余 {len(self.nodes)} 个节点")
+        self._update_sel_label()
 
     def _selected_nodes(self):
         sel = self.tree.selection()

@@ -67,11 +67,27 @@ class SpeedTester:
                                      stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL,
                                      creationflags=0x08000000)  # CREATE_NO_WINDOW：不弹黑窗
-        # 等所有 listener 起来
-        for i in range(len(nodes)):
-            if not self._wait_port(self.base_port + i, timeout=10):
-                raise RuntimeError(f"listener {self.base_port + i} 未启动")
+        # 等所有 listener 起来（并行探测，总超时 20s）
+        if not self._wait_ports(len(nodes), timeout=20):
+            raise RuntimeError("mihomo listener 未能在超时内启动")
         return cfg_path
+
+    def _wait_ports(self, n, timeout=20):
+        """并行探测 n 个端口是否全部就绪，总超时 timeout 秒。"""
+        import socket
+        def _probe(port):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if self._stop.is_set():
+                    return False
+                try:
+                    with socket.create_connection(("127.0.0.1", port), 0.3):
+                        return True
+                except OSError:
+                    time.sleep(0.1)
+            return False
+        with ThreadPoolExecutor(max_workers=min(n, 32)) as ex:
+            return all(ex.map(_probe, [self.base_port + i for i in range(n)]))
 
     def stop(self):
         self._stop.set()
@@ -162,6 +178,62 @@ class SpeedTester:
         res = self._test_latency(node)
         return self._test_download(res, node)
 
+    def run_latency(self, nodes, on_result=None, subset=None):
+        """只测延时。subset 为 (name,result) 时表示对指定节点重测。返回全部结果列表。"""
+        cb = on_result or self.on_result
+        tasks = [dict(n, _idx=i) for i, n in enumerate(nodes)]
+        results = []
+        ex = ThreadPoolExecutor(max_workers=self.concurrency)
+        futs = [ex.submit(self._test_latency, t) for t in tasks]
+        try:
+            for fut in as_completed(futs):
+                if self._stop.is_set():
+                    break
+                try:
+                    r = fut.result()
+                    results.append(r)
+                    if cb:
+                        cb(r)
+                except Exception as e:
+                    _r = {"name": "?", "alive": False, "err": f"ex:{type(e).__name__}"}
+                    results.append(_r)
+                    if cb:
+                        cb(_r)
+        finally:
+            for f in futs:
+                f.cancel()
+            ex.shutdown(wait=False)
+        return results
+
+    def run_download(self, nodes, on_result=None, results=None):
+        """只测下载速度（沿用既有结果里的 server 等信息）。"""
+        cb = on_result or self.on_result
+        tasks = [dict(n, _idx=i) for i, n in enumerate(nodes)]
+        prior = {r["name"]: r for r in (results or [])}
+        ex = ThreadPoolExecutor(max_workers=self.concurrency)
+        futs = []
+        for t in tasks:
+            r = dict(prior.get(t["name"], {"name": t["name"], "alive": True,
+                                           "latency": None, "dl_mbps": None, "err": None}))
+            r.update(name=t["name"], type=t.get("type"), server=t.get("server"),
+                     port=t.get("port"), tls=bool(t.get("tls")))
+            futs.append(ex.submit(self._test_download, r, t))
+        try:
+            for fut in as_completed(futs):
+                if self._stop.is_set():
+                    break
+                try:
+                    r = fut.result()
+                    if cb:
+                        cb(r)
+                except Exception:
+                    pass
+        finally:
+            for f in futs:
+                f.cancel()
+            ex.shutdown(wait=False)
+        return [f.result() for f in futs]
+
     def run(self, nodes, on_result=None):
         """两阶段测速：先并发测延时 -> 清掉不通的 -> 只对存活节点测下载。返回全部结果列表。"""
         cb = on_result or self.on_result
@@ -174,20 +246,7 @@ class SpeedTester:
                 cb(r)
 
         # ---- 阶段 1：延时（全部节点） ----
-        ex = ThreadPoolExecutor(max_workers=self.concurrency)
-        futs = [ex.submit(self._test_latency, t) for t in tasks]
-        try:
-            for fut in as_completed(futs):
-                if self._stop.is_set():
-                    break
-                try:
-                    _emit(fut.result())
-                except Exception as e:
-                    _emit({"name": "?", "alive": False, "err": f"ex:{type(e).__name__}"})
-        finally:
-            for f in futs:
-                f.cancel()
-            ex.shutdown(wait=False)
+        self.run_latency(nodes, on_result=_emit)
 
         # ---- 阶段 2：下载（仅存活节点，省时间） ----
         alive = [(t, r) for t, r in zip(tasks, results) if r.get("alive")]
