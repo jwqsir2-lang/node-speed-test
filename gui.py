@@ -33,6 +33,8 @@ class App:
         self.running = False
         self.sort_col = None     # 当前排序列；None = 保持导入顺序
         self.sort_rev = False    # 该列是否降序
+        self._dirty = False      # 有待刷新的结果
+        self._flush_scheduled = False
         self._build_ui()
 
     # ---------------- UI ----------------
@@ -426,12 +428,23 @@ class App:
             pass  # 窗口已关
 
     def log_msg(self, text):
-        """活动日志（主线程安全）。"""
-        t = time.strftime("%H:%M:%S")
-        self.log.config(state="normal")
-        self.log.insert("end", f"[{t}] {text}\n")
-        self.log.see("end")
-        self.log.config(state="disabled")
+        """活动日志。可从工作线程调用，统一转到主线程。"""
+        def _do():
+            try:
+                t = time.strftime("%H:%M:%S")
+                self.log.config(state="normal")
+                self.log.insert("end", f"[{t}] {text}\n")
+                self.log.see("end")
+                self.log.config(state="disabled")
+            except RuntimeError:
+                pass  # 窗口已关
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _do()
+            else:
+                self.root.after(0, _do)
+        except RuntimeError:
+            pass
 
     def stop_test(self):
         if self.tester:
@@ -494,7 +507,19 @@ class App:
 
     def _on_result(self, r):
         self.results[r["name"]] = r
-        self.root.after(0, self.refresh_table)
+        # 只标记脏，真正的刷新合并到定时器里做（避免高并发下每个结果都全表重绘）
+        self._dirty = True
+        if not self._flush_scheduled:
+            self._flush_scheduled = True
+            self.root.after(300, self._flush_refresh)
+
+    def _flush_refresh(self):
+        """合并 300ms 内的所有结果，只重绘一次表。"""
+        self._flush_scheduled = False
+        if not self._dirty:
+            return
+        self._dirty = False
+        self.refresh_table()
 
     def clear_results(self):
         self.results = {}

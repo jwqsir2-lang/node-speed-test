@@ -67,27 +67,39 @@ class SpeedTester:
                                      stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL,
                                      creationflags=0x08000000)  # CREATE_NO_WINDOW：不弹黑窗
-        # 等所有 listener 起来（并行探测，总超时 20s）
-        if not self._wait_ports(len(nodes), timeout=20):
+        # 等 listener 起来：超过一半就绪即放行（其余在测试时自然完成握手），
+        # 避免个别慢端口让全部节点干等
+        ready = self._wait_ports(len(nodes), timeout=20)
+        if ready == 0:
             raise RuntimeError("mihomo listener 未能在超时内启动")
         return cfg_path
 
     def _wait_ports(self, n, timeout=20):
-        """并行探测 n 个端口是否全部就绪，总超时 timeout 秒。"""
+        """并行探测端口，返回就绪端口的索引集合。超过一半就绪即返回。"""
         import socket
+        half = max(1, n // 2)
+        ports = {self.base_port + i: i for i in range(n)}
+        ready = set()
+        lock = threading.Lock()
+
         def _probe(port):
             deadline = time.time() + timeout
             while time.time() < deadline:
                 if self._stop.is_set():
-                    return False
+                    return
+                if len(ready) >= half:
+                    return
                 try:
                     with socket.create_connection(("127.0.0.1", port), 0.3):
-                        return True
+                        with lock:
+                            ready.add(ports[port])
+                        return
                 except OSError:
                     time.sleep(0.1)
-            return False
-        with ThreadPoolExecutor(max_workers=min(n, 32)) as ex:
-            return all(ex.map(_probe, [self.base_port + i for i in range(n)]))
+
+        with ThreadPoolExecutor(max_workers=min(n, 64)) as ex:
+            list(ex.map(_probe, list(ports)))
+        return ready
 
     def stop(self):
         self._stop.set()
