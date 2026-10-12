@@ -1,0 +1,36 @@
+name: 打包发布
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 PyInstaller
+        run: pip install pyinstaller pyyaml
+
+      - name: 打包（文件夹模式）
+        run: pyinstaller --noconfirm --windowed --name 节点测速 --add-data "mihomo.exe;." --add-data "geoip.metadb;." --add-data "GeoSite.dat;." gui.py
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: 节点测速-windows
+          path: dist/节点测速/
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/节点测速/节点测速.exe
+            dist/节点测速/_internal/mihomo.exe

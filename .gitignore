@@ -1,0 +1,7 @@
+# 编译产物 / 临时文件
+__pycache__/
+*.pyc
+_run.yaml
+*.spec
+build/
+dist/
