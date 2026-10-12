@@ -31,8 +31,42 @@ def from_clash_yaml(text):
     return out
 
 
+def _sb_transport(o, p):
+    """sing-box transport -> clash network 配置。"""
+    t = o.get("transport") or {}
+    if not isinstance(t, dict):
+        return
+    tt = t.get("type")
+    if tt == "ws":
+        p["network"] = "ws"
+        ws = {"path": t.get("path", "/")}
+        hdrs = t.get("headers") or {}
+        if isinstance(hdrs, dict) and hdrs:
+            ws["headers"] = {str(k): (v[0] if isinstance(v, list) else v) for k, v in hdrs.items()}
+        p["ws-opts"] = ws
+    elif tt == "grpc":
+        p["network"] = "grpc"
+        p["grpc-opts"] = {"grpc-service-name": t.get("service_name", "")}
+    elif tt == "http":
+        p["network"] = "http"
+        ho = {"path": [t.get("path", "/")]}
+        hdrs = t.get("headers") or {}
+        if isinstance(hdrs, dict) and hdrs:
+            ho["headers"] = {str(k): (v if isinstance(v, list) else [v]) for k, v in hdrs.items()}
+        p["http-opts"] = ho
+    elif tt == "httpupgrade":
+        # mihomo 用 ws + Connection/Upgrade 头模拟 httpupgrade
+        p["network"] = "ws"
+        ws = {"path": t.get("path", "/")}
+        hdrs = dict(t.get("headers") or {})
+        hdrs.setdefault("Connection", "Upgrade")
+        hdrs.setdefault("Upgrade", "websocket")
+        ws["headers"] = {str(k): (v[0] if isinstance(v, list) else v) for k, v in hdrs.items()}
+        p["ws-opts"] = ws
+
+
 def from_singbox_json(text):
-    """sing-box outbound -> clash proxy（仅保留需要测速的字段）。"""
+    """sing-box outbound -> clash proxy（完整转换，mihomo 直接可用）。"""
     d = json.loads(text)
     out = []
     for o in d.get("outbounds") or []:
@@ -43,17 +77,66 @@ def from_singbox_json(text):
             continue
         p = {"name": o["tag"], "type": t, "server": o["server"],
              "port": o.get("server_port") or o.get("port")}
+
+        # ---- TLS（trojan/vless/hysteria2/anytls 等都在 tls 字段里） ----
         tls = o.get("tls") or {}
         if isinstance(tls, dict) and tls.get("enabled"):
             p["tls"] = True
             if tls.get("server_name"):
-                p["servername"] = tls["server_name"]
+                p["sni"] = tls["server_name"]
             if tls.get("insecure"):
                 p["skip-cert-verify"] = True
-        if o.get("username"):
-            p["username"] = o["username"]
-            p["password"] = o.get("password")
-        out.append(_norm(p) or p)
+            alpn = tls.get("alpn")
+            if alpn:
+                p["alpn"] = alpn if isinstance(alpn, list) else [alpn]
+            r = tls.get("reality") or {}
+            if isinstance(r, dict) and r.get("public_key"):
+                p["reality-opts"] = {"public-key": r.get("public_key"),
+                                     "short-id": (r.get("short_id") or [""])[0]
+                                     if isinstance(r.get("short_id"), list)
+                                     else (r.get("short_id") or "")}
+            if tls.get("fingerprint"):
+                p["client-fingerprint"] = tls["fingerprint"]
+
+        # ---- 各协议特有字段 ----
+        if t == "vmess":
+            p["uuid"] = o.get("uuid", "")
+            p["alterId"] = o.get("alter_id", 0)
+            p["cipher"] = o.get("security", "auto")
+        elif t == "vless":
+            p["uuid"] = o.get("uuid", "")
+            if o.get("flow"):
+                p["flow"] = o["flow"]
+        elif t in ("trojan", "shadowsocks", "hysteria2", "anytls", "hysteria", "tuic"):
+            if o.get("password") is not None:
+                p["password"] = o["password"]
+            if t == "shadowsocks":
+                p["cipher"] = o.get("cipher", "aes-128-gcm")
+            if t in ("hysteria2", "hysteria"):
+                obfs = o.get("obfs") or {}
+                if isinstance(obfs, dict) and obfs.get("type") == "salamander":
+                    p["obfs"] = "salamander"
+                    p["obfs-password"] = obfs.get("password", "")
+                if o.get("up_mbps"):
+                    p["up"] = f"{o['up_mbps']} Mbps"
+                if o.get("down_mbps"):
+                    p["down"] = f"{o['down_mbps']} Mbps"
+            if t == "tuic":
+                p["uuid"] = o.get("uuid", "")
+                p["congestion-controller"] = o.get("congestion_control", "bbr")
+                p["udp-relay-mode"] = o.get("udp_relay_mode", "native")
+
+        # ---- transport（ws/grpc/http） ----
+        _sb_transport(o, p)
+
+        # http/socks 代理类型
+        if t in ("http", "socks"):
+            if o.get("username"):
+                p["username"] = o["username"]
+                p["password"] = o.get("password", "")
+
+        n = _norm(p)
+        out.append(n if n else p)
     return out
 
 

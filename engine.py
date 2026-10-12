@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import yaml
 
 MIHOMO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mihomo.exe")
-LAT_URL = "https://www.google.com/generate_204"
+LAT_URL = "https://www.gstatic.com/generate_204"
 DL_URL = "https://speed.cloudflare.com/__down?bytes={bytes}"
 
 
