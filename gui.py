@@ -20,6 +20,7 @@ from exporters import to_clash_yaml, to_singbox_json, to_base64_links, to_csv, t
 APP_TITLE = "节点测速工具"
 GEOMETRY = "1100x640"
 SUBS_FILE = os.path.join(HERE, "subs.json")
+SETTINGS_FILE = os.path.join(HERE, "settings.json")
 
 
 class App:
@@ -56,21 +57,23 @@ class App:
         self.src_label = ttk.Label(row, textvariable=self.src_var, foreground="#666")
         self.src_label.pack(side="left", padx=(10, 0))
 
-        # 参数区
+        # 参数区（默认值从 settings.json 读，记住上次）
         par = ttk.Frame(imp); par.pack(fill="x", padx=6, pady=(0, 6))
-        self.conc_var = tk.IntVar(value=16)
-        self.dlkb_var = tk.IntVar(value=1000)
-        self.latto_var = tk.IntVar(value=8)
-        self.dlto_var = tk.IntVar(value=20)
-        for label, var, lo, hi, tip in (
-            ("并发", self.conc_var, 1, 64, "并发线程数"),
-            ("下载KB", self.dlkb_var, 50, 20000, "每个节点下载的数据量(KB)"),
-            ("延时超时(s)", self.latto_var, 2, 60, "延时测试超时"),
-            ("下载超时(s)", self.dlto_var, 5, 120, "下载测试超时"),
+        st = self._load_settings()
+        self.conc_var = tk.IntVar(value=st.get("concurrency", 32))
+        self.dlkb_var = tk.IntVar(value=st.get("dlkb", 1024))
+        self.latto_var = tk.IntVar(value=st.get("latto", 5))
+        self.dlto_var = tk.IntVar(value=st.get("dlto", 15))
+        for label, var, lo, hi in (
+            ("并发", self.conc_var, 1, 256, ),
+            ("下载KB", self.dlkb_var, 50, 20000),
+            ("延时超时(s)", self.latto_var, 2, 60),
+            ("下载超时(s)", self.dlto_var, 5, 120),
         ):
             f = ttk.Frame(par); f.pack(side="left", padx=(0, 12))
             ttk.Label(f, text=label).pack(side="left")
             ttk.Spinbox(f, from_=lo, to=hi, width=6, textvariable=var).pack(side="left", padx=(4, 0))
+            var.trace_add("write", lambda *_: self._save_settings())
 
         # ---- 操作区 ----
         act = ttk.Frame(top)
@@ -85,6 +88,8 @@ class App:
         self.btn_stop.pack(side="left", padx=(4, 0))
         self.btn_clear = ttk.Button(act, text="清空结果", command=self.clear_results)
         self.btn_clear.pack(side="left", padx=(4, 0))
+        self.btn_dead = ttk.Button(act, text="清除测不通的节点", command=self.remove_dead)
+        self.btn_dead.pack(side="left", padx=(4, 0))
         self.status = ttk.Label(act, text="就绪")
         self.status.pack(side="left", padx=(12, 0))
         self.prog = ttk.Progressbar(act, mode="determinate", length=200)
@@ -153,6 +158,28 @@ class App:
     def _update_sel_label(self, _ev=None):
         n = len(self.tree.selection())
         self.lbl_sel.config(text=f"已选 {n} 行" if n else "未选中行时导出全部可用节点")
+
+    # ---------------- 参数记忆 ----------------
+    def _load_settings(self):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        return {}
+
+    def _save_settings(self):
+        try:
+            data = {"concurrency": self.conc_var.get(),
+                    "dlkb": self.dlkb_var.get(),
+                    "latto": self.latto_var.get(),
+                    "dlto": self.dlto_var.get()}
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass  # 参数保存失败不影响使用
 
     # ---------------- 订阅管理 ----------------
     def _load_subs(self):
@@ -520,6 +547,26 @@ class App:
             return
         self._dirty = False
         self.refresh_table()
+
+    def remove_dead(self):
+        """清除所有延时测试不通的节点（alive=False）。"""
+        if not self.results:
+            messagebox.showinfo("没有结果", "请先测速，再清除测不通的节点。")
+            return
+        dead = [n for n in self.nodes if self.results.get(n["name"], {}).get("alive") is False]
+        if not dead:
+            messagebox.showinfo("没有测不通的节点", "当前所有节点都可用。")
+            return
+        if not messagebox.askyesno("清除节点", f"删除 {len(dead)} 个测不通的节点？"):
+            return
+        names = {n["name"] for n in dead}
+        self.nodes = [n for n in self.nodes if n["name"] not in names]
+        for nm in names:
+            self.results.pop(nm, None)
+        self.log_msg(f"清除 {len(names)} 个测不通节点，剩余 {len(self.nodes)} 个")
+        self.refresh_table()
+        self.status.config(text=f"剩余 {len(self.nodes)} 个节点")
+        self._update_sel_label()
 
     def clear_results(self):
         self.results = {}
