@@ -19,6 +19,7 @@ from exporters import to_clash_yaml, to_singbox_json, to_base64_links, to_csv, t
 
 APP_TITLE = "节点测速工具"
 GEOMETRY = "1100x640"
+SUBS_FILE = os.path.join(HERE, "subs.json")
 
 
 class App:
@@ -47,6 +48,7 @@ class App:
         row = ttk.Frame(imp); row.pack(fill="x", padx=6, pady=4)
         ttk.Button(row, text="打开文件…", width=12, command=self.load_file).pack(side="left")
         ttk.Button(row, text="从订阅 URL 导入", width=14, command=self.load_url).pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="订阅管理…", width=12, command=self.manage_subs).pack(side="left", padx=(4, 0))
         ttk.Button(row, text="从文本粘贴导入", width=14, command=self.load_text).pack(side="left", padx=(4, 0))
         ttk.Button(row, text="从剪贴板导入", width=12, command=self.load_clipboard).pack(side="left", padx=(4, 0))
         self.src_label = ttk.Label(row, textvariable=self.src_var, foreground="#666")
@@ -132,6 +134,113 @@ class App:
     def _update_sel_label(self, _ev=None):
         n = len(self.tree.selection())
         self.lbl_sel.config(text=f"已选 {n} 行" if n else "未选中行时导出全部可用节点")
+
+    # ---------------- 订阅管理 ----------------
+    def _load_subs(self):
+        """从 subs.json 读取已保存的订阅。格式: [{"name": ..., "url": ...}]"""
+        try:
+            with open(SUBS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [s for s in data if isinstance(s, dict) and s.get("url")]
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        return []
+
+    def _save_subs(self, subs):
+        with open(SUBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(subs, f, ensure_ascii=False, indent=2)
+
+    def manage_subs(self):
+        """订阅管理窗口：列表 + 增删改 + 直接测速。"""
+        subs = self._load_subs()
+        d = tk.Toplevel(self.root)
+        d.title("订阅管理")
+        d.geometry("640x420")
+        d.transient(self.root)
+        d.focus_set()
+        d.grab_set()
+        self._center_over(d, 640, 420)
+
+        frm = ttk.Frame(d)
+        frm.pack(fill="both", expand=True, padx=8, pady=6)
+        cols = ("name", "url")
+        tree = ttk.Treeview(frm, columns=cols, show="headings", height=10)
+        tree.heading("name", text="名称")
+        tree.heading("url", text="订阅地址")
+        tree.column("name", width=140)
+        tree.column("url", width=440)
+        vsb = ttk.Scrollbar(frm, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def _fill():
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for i, s in enumerate(subs):
+                tree.insert("", "end", iid=str(i), values=(s.get("name", ""), s.get("url", "")))
+
+        _fill()
+
+        btns = ttk.Frame(d)
+        btns.pack(fill="x", padx=8, pady=6)
+        en_name = ttk.Entry(btns, width=14)
+        en_url = ttk.Entry(btns)
+        en_name.pack(side="left")
+        en_url.pack(side="left", fill="x", expand=True, padx=(4, 4))
+
+        def _add():
+            name = en_name.get().strip() or "未命名订阅"
+            url = en_url.get().strip()
+            if not url:
+                messagebox.showwarning("缺少地址", "请输入订阅地址。", parent=d)
+                return
+            if any(s["url"] == url for s in subs):
+                messagebox.showinfo("已存在", "这个地址已经在列表里了。", parent=d)
+                return
+            subs.append({"name": name, "url": url})
+            self._save_subs(subs)
+            en_name.delete(0, "end"); en_url.delete(0, "end")
+            _fill()
+
+        def _del():
+            sel = tree.selection()
+            if not sel:
+                return
+            keep = [s for i, s in enumerate(subs) if str(i) not in sel]
+            subs[:] = keep
+            self._save_subs(subs)
+            _fill()
+
+        def _rename():
+            sel = tree.selection()
+            if not sel:
+                return
+            i = int(sel[0])
+            new = messagebox.askstring("重命名", "新的订阅名称:", parent=d,
+                                       initialvalue=subs[i].get("name", ""))
+            if new and new.strip():
+                subs[i]["name"] = new.strip()
+                self._save_subs(subs)
+                _fill()
+
+        def _test():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("未选择", "先在列表里选中一个订阅。", parent=d)
+                return
+            s = subs[int(sel[0])]
+            d.destroy()
+            self.status.config(text="正在下载订阅…")
+            self.root.update()
+            self._import(s["url"], s.get("name", "订阅"))
+
+        ttk.Button(btns, text="加入", command=_add).pack(side="left")
+        ttk.Button(btns, text="重命名", command=_rename).pack(side="left", padx=(4, 0))
+        ttk.Button(btns, text="删除选中", command=_del).pack(side="left", padx=(4, 0))
+        ttk.Button(btns, text="测这个订阅", command=_test).pack(side="right")
+        d.bind("<Return>", lambda _ev: _add())
 
     # ---------------- 导入 ----------------
     def _import(self, src, label):

@@ -120,14 +120,14 @@ class SpeedTester:
         r.close()
         return n, el
 
-    def _test_one(self, node):
+    def _test_latency(self, node):
+        """只测延时。alive=False 的节点不进入第二阶段。"""
         idx = node["_idx"]
         port = self.base_port + idx
         res = {"name": node["name"], "type": node.get("type"), "server": node.get("server"),
                "port": node.get("port"), "tls": bool(node.get("tls")),
                "alive": False, "latency": None, "dl_mbps": None, "err": None}
         op = self._opener(port)
-        # 延时
         try:
             _, el = self._fetch(op, LAT_URL, self.timeout_lat)
             res["latency"] = round(el * 1000)
@@ -137,11 +137,16 @@ class SpeedTester:
             res["err"] = "lat-http"
         except Exception as e:
             res["err"] = f"lat:{type(e).__name__}"
+        return res
+
+    def _test_download(self, res, node):
+        """对已存活的节点补测下载速度，结果就地写入 res。"""
+        if not res.get("alive"):
             return res
         if self._stop.is_set():
             res["err"] = "stopped"
             return res
-        # 下载
+        op = self._opener(self.base_port + node["_idx"])
         try:
             n, el = self._fetch(op, DL_URL.format(bytes=self.dl_bytes), self.timeout_dl,
                                 maxbytes=self.dl_bytes)
@@ -152,28 +157,59 @@ class SpeedTester:
             res["err"] = f"dl:{type(e).__name__}"
         return res
 
+    def _test_one(self, node):
+        """单节点全流程（兼容旧调用与 __main__ 自测）。"""
+        res = self._test_latency(node)
+        return self._test_download(res, node)
+
     def run(self, nodes, on_result=None):
-        """并发测试所有节点。on_result(result) 每出一个结果回调一次。返回全部结果列表。"""
+        """两阶段测速：先并发测延时 -> 清掉不通的 -> 只对存活节点测下载。返回全部结果列表。"""
         cb = on_result or self.on_result
         tasks = [dict(n, _idx=i) for i, n in enumerate(nodes)]
         results = []
+
+        def _emit(r):
+            results.append(r)
+            if cb:
+                cb(r)
+
+        # ---- 阶段 1：延时（全部节点） ----
         ex = ThreadPoolExecutor(max_workers=self.concurrency)
-        futs = [ex.submit(self._test_one, t) for t in tasks]
+        futs = [ex.submit(self._test_latency, t) for t in tasks]
         try:
             for fut in as_completed(futs):
                 if self._stop.is_set():
                     break
                 try:
-                    r = fut.result()
+                    _emit(fut.result())
                 except Exception as e:
-                    r = {"name": "?", "alive": False, "err": f"ex:{type(e).__name__}"}
-                results.append(r)
-                if cb:
-                    cb(r)
+                    _emit({"name": "?", "alive": False, "err": f"ex:{type(e).__name__}"})
         finally:
             for f in futs:
                 f.cancel()
             ex.shutdown(wait=False)
+
+        # ---- 阶段 2：下载（仅存活节点，省时间） ----
+        alive = [(t, r) for t, r in zip(tasks, results) if r.get("alive")]
+        if alive and not self._stop.is_set():
+            ex2 = ThreadPoolExecutor(max_workers=self.concurrency)
+            futs2 = [ex2.submit(self._test_download, r, t) for t, r in alive]
+            try:
+                for fut in as_completed(futs2):
+                    if self._stop.is_set():
+                        break
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        pass  # 错误已在 _test_download 内写入 res
+            finally:
+                for f in futs2:
+                    f.cancel()
+                ex2.shutdown(wait=False)
+            # 存活节点的下载结果已就地更新，重新回调一次让表格刷新
+            if cb:
+                for _, r in alive:
+                    cb(r)
         return results
 
 
