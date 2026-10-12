@@ -30,6 +30,8 @@ class App:
         self.results = {}        # name -> result dict
         self.tester = None
         self.running = False
+        self.sort_col = None     # 当前排序列；None = 保持导入顺序
+        self.sort_rev = False    # 该列是否降序
         self._build_ui()
 
     # ---------------- UI ----------------
@@ -83,15 +85,19 @@ class App:
         # ---- 结果表 ----
         mid = ttk.Frame(self.root)
         mid.pack(side="top", fill="both", expand=True, padx=6, pady=4)
-        cols = ("name", "type", "server", "port", "tls", "alive", "latency", "dl", "err")
+        cols = ("idx", "name", "type", "server", "port", "tls", "alive", "latency", "dl", "err")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="extended")
-        widths = {"name": 300, "type": 60, "server": 150, "port": 60, "tls": 40,
+        widths = {"idx": 44, "name": 300, "type": 60, "server": 150, "port": 60, "tls": 40,
                   "alive": 50, "latency": 90, "dl": 100, "err": 120}
         for c in cols:
-            self.tree.heading(c, text={"name": "节点名", "type": "类型", "server": "服务器",
+            self.tree.heading(c, text={"idx": "#", "name": "节点名", "type": "类型", "server": "服务器",
                                        "port": "端口", "tls": "TLS", "alive": "可用",
-                                       "latency": "延时(ms)", "dl": "下载(MB/s)", "err": "错误"}[c])
+                                       "latency": "延时(ms)", "dl": "下载(MB/s)", "err": "错误"}[c],
+                             command=(lambda col=c: self.sort_by(col)))
             self.tree.column(c, width=widths[c], stretch=(c == "name"))
+        self.tree.column("idx", anchor="center")
+        self.tree.column("latency", anchor="e")
+        self.tree.column("dl", anchor="e")
         vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -119,6 +125,13 @@ class App:
         ):
             ttk.Button(bot, text=label, command=fn).pack(side="left", padx=(4, 0))
         ttk.Button(bot, text="复制结果表格(Markdown)", command=self.copy_md).pack(side="left", padx=(10, 0))
+        self.lbl_sel = ttk.Label(bot, text="", foreground="#666")
+        self.lbl_sel.pack(side="right")
+        self.tree.bind("<<TreeviewSelect>>", self._update_sel_label)
+
+    def _update_sel_label(self, _ev=None):
+        n = len(self.tree.selection())
+        self.lbl_sel.config(text=f"已选 {n} 行" if n else "未选中行时导出全部可用节点")
 
     # ---------------- 导入 ----------------
     def _import(self, src, label):
@@ -147,6 +160,10 @@ class App:
         d = tk.Toplevel(self.root)
         d.title("从订阅 URL 导入")
         d.geometry("460x120")
+        d.transient(self.root)          # 随主窗口最小化/置顶
+        d.focus_set()
+        d.grab_set()                    # 模态：必须先关掉它才能点主窗口
+        self._center_over(d, 460, 120)
         ttk.Label(d, text="订阅地址:").pack(pady=8)
         e = ttk.Entry(d, width=58)
         e.pack(padx=10)
@@ -162,10 +179,25 @@ class App:
         ttk.Button(d, text="导入", command=ok).pack(pady=10)
         d.bind("<Return>", lambda _ev: ok())
 
+    def _center_over(self, d, w, h):
+        """把子窗口 d 放在主窗口正中央（不超出屏幕）。"""
+        self.root.update_idletasks()
+        rx = self.root.winfo_x(); ry = self.root.winfo_y()
+        rw = self.root.winfo_width(); rh = self.root.winfo_height()
+        x = rx + (rw - w) // 2
+        y = ry + (rh - h) // 2
+        sw = d.winfo_screenwidth(); sh = d.winfo_screenheight()
+        x = max(0, min(x, sw - w)); y = max(0, min(y, sh - h))
+        d.geometry(f"{w}x{h}+{x}+{y}")
+
     def load_text(self):
         d = tk.Toplevel(self.root)
         d.title("粘贴节点数据")
         d.geometry("620x360")
+        d.transient(self.root)
+        d.focus_set()
+        d.grab_set()
+        self._center_over(d, 620, 360)
         ttk.Label(d, text="粘贴 Clash YAML / sing-box JSON / 节点文本:").pack(pady=6)
         t = tk.Text(d, width=80, height=18)
         t.pack(fill="both", expand=True, padx=8)
@@ -251,14 +283,52 @@ class App:
         self.status.config(text="已清空")
 
     # ---------------- 表格 ----------------
+    def _row_order(self):
+        """返回 (索引, 节点) 的当前显示顺序（按排序列排）。"""
+        items = list(range(len(self.nodes)))
+        col, rev = self.sort_col, self.sort_rev
+        if not col:
+            return list(enumerate(self.nodes))
+
+        def key(i):
+            n, r = self.nodes[i], self.results.get(self.nodes[i]["name"], {})
+            if col == "latency":
+                return r.get("latency") if r.get("latency") is not None else 10**9
+            if col == "dl":
+                return r.get("dl_mbps") if r.get("dl_mbps") is not None else -1.0
+            if col == "alive":
+                return 0 if r.get("alive") else 1
+            if col == "idx":
+                return i
+            if col == "name":
+                return self.nodes[i]["name"]
+            return str(n.get(col, "") or "")
+
+        return sorted(((i, self.nodes[i]) for i in items), key=lambda p: key(p[0]), reverse=rev)
+
+    def sort_by(self, col):
+        if self.sort_col == col:
+            self.sort_rev = not self.sort_rev
+        else:
+            self.sort_col, self.sort_rev = col, False
+        for c in ("idx", "name", "type", "server", "port", "tls", "alive", "latency", "dl", "err"):
+            arrow = ""
+            if c == col:
+                arrow = " ▼" if self.sort_rev else " ▲"
+            base = {"idx": "#", "name": "节点名", "type": "类型", "server": "服务器",
+                    "port": "端口", "tls": "TLS", "alive": "可用",
+                    "latency": "延时(ms)", "dl": "下载(MB/s)", "err": "错误"}[c]
+            self.tree.heading(c, text=base + arrow)
+        self.refresh_table()
+
     def refresh_table(self):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        for i, n in enumerate(self.nodes):
+        for display_pos, (i, n) in enumerate(self._row_order(), start=1):
             name = n["name"]
             r = self.results.get(name, {})
             alive = r.get("alive")
-            vals = (name, n.get("type", ""), n.get("server", ""), n.get("port", ""),
+            vals = (display_pos, name, n.get("type", ""), n.get("server", ""), n.get("port", ""),
                     "是" if n.get("tls") else "",
                     "✓" if alive else ("✗" if alive is False else "…"),
                     r.get("latency") if r.get("latency") is not None else "",
@@ -322,6 +392,14 @@ class App:
         ttk.Button(d, text="复制 JSON", command=lambda: self._copy(json.dumps(payload, ensure_ascii=False, indent=2))).pack(pady=6)
 
     # ---------------- 导出 ----------------
+    def _export_nodes(self):
+        """选中了行就只导出选中的（按当前排序顺序）；否则导出全部可用节点（按速度排序）。"""
+        sel = self.tree.selection()
+        if sel:
+            idxs = sorted((int(iid) for iid in sel), key=lambda i: [p[0] for p in self._row_order()].index(i))
+            return [self.nodes[i] for i in idxs]
+        return [n for n, _ in self._alive_sorted()]
+
     def _alive_sorted(self):
         rows = []
         for n in self.nodes:
@@ -336,7 +414,8 @@ class App:
     def _save(self, content, default_name):
         p = filedialog.asksaveasfilename(defaultextension=os.path.splitext(default_name)[1],
                                          initialfile=default_name,
-                                         filetypes=[("全部文件", "*.*")])
+                                         filetypes=[("全部文件", "*.*")],
+                                         parent=self.root)
         if not p:
             return None
         mode = "wb" if isinstance(content, bytes) else "w"
@@ -347,25 +426,25 @@ class App:
         return p
 
     def exp_clash(self):
-        rows = self._alive_sorted()
-        if not rows:
-            messagebox.showwarning("无可用节点", "没有可导出的存活节点。")
+        ns = self._export_nodes()
+        if not ns:
+            messagebox.showwarning("无可用节点", "没有可导出的存活节点。请先选中行或完成测速。")
             return
-        self._save(to_clash_yaml([n for n, _ in rows]), "speedtest.yaml")
+        self._save(to_clash_yaml(ns), "speedtest.yaml")
 
     def exp_singbox(self):
-        rows = self._alive_sorted()
-        if not rows:
-            messagebox.showwarning("无可用节点", "没有可导出的存活节点。")
+        ns = self._export_nodes()
+        if not ns:
+            messagebox.showwarning("无可用节点", "没有可导出的存活节点。请先选中行或完成测速。")
             return
-        self._save(to_singbox_json([n for n, _ in rows]), "speedtest.json")
+        self._save(to_singbox_json(ns), "speedtest.json")
 
     def exp_base64(self):
-        rows = self._alive_sorted()
-        if not rows:
-            messagebox.showwarning("无可用节点", "没有可导出的存活节点。")
+        ns = self._export_nodes()
+        if not ns:
+            messagebox.showwarning("无可用节点", "没有可导出的存活节点。请先选中行或完成测速。")
             return
-        self._save(to_base64_links([n for n, _ in rows]), "speedtest.txt")
+        self._save(to_base64_links(ns), "speedtest.txt")
 
     def exp_csv(self):
         self._save(to_csv(self.nodes, self.results), "speedtest.csv")
